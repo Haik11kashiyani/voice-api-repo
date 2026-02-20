@@ -15,6 +15,13 @@ tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
 class TextRequest(BaseModel):
     text: str
 
+@app.get("/")
+def read_root():
+    return {
+        "message": "Welcome to My Voice API! The server is running successfully.",
+        "usage": "Send a POST request to /generate with JSON body: {'text': 'Your text here'}"
+    }
+
 @app.post("/generate")
 def generate_audio(request: TextRequest):
     # Hugging Face requires temporary files to be saved in /tmp
