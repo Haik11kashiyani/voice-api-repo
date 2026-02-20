@@ -1,4 +1,3 @@
 fastapi
 uvicorn
 pydantic
-TTS==0.22.0

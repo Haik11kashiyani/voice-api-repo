@@ -1,8 +1,7 @@
-FROM python:3.9-slim
+FROM ghcr.io/coqui-ai/tts-cpu
 
+# Keep essential system dependencies
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    gcc \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
