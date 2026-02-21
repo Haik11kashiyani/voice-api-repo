@@ -26,7 +26,7 @@ TEXT_TO_SAY = (
 
 MAX_RETRIES = 5          # retries for cold-start wake-up
 RETRY_DELAY_SECS = 15    # seconds between retries
-REQUEST_TIMEOUT = 120     # seconds for the generation request
+REQUEST_TIMEOUT = 300     # seconds (sentence-by-sentence on CPU is slow)
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.0"))
 SPEED = float(os.getenv("TTS_SPEED", "1.0"))
 
 # Per-sentence: generate N takes, pick the smoothest
-TAKES_PER_SENTENCE = int(os.getenv("TTS_TAKES", "3"))
+TAKES_PER_SENTENCE = int(os.getenv("TTS_TAKES", "2"))
 
 # Crossfade duration between sentences (milliseconds)
 CROSSFADE_MS = int(os.getenv("CROSSFADE_MS", "80"))
