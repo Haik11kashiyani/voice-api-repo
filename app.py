@@ -171,9 +171,13 @@ def _score(wav: np.ndarray, ref_env: np.ndarray | None, sr: int) -> float:
 # ── Minimal cleanup: trim silence + fade edges ───────────────────────────
 
 def _find_speech_start(wav: np.ndarray, sr: int,
-                       frame_ms: int = 15, thresh: float = 0.004,
-                       need: int = 3, back_ms: int = 20) -> int:
-    """Scan forward to find where speech energy begins."""
+                       frame_ms: int = 10, thresh: float = 0.008,
+                       need: int = 4, back_ms: int = 8) -> int:
+    """Scan forward to find where speech energy begins.
+
+    Aggressive: requires 4 consecutive frames above a higher threshold
+    and only keeps 8 ms of pre-speech padding.
+    """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
     for s in range(0, len(wav) - fl, fl):
@@ -189,9 +193,12 @@ def _find_speech_start(wav: np.ndarray, sr: int,
 
 
 def _find_speech_end(wav: np.ndarray, sr: int,
-                     frame_ms: int = 15, thresh: float = 0.004,
-                     need: int = 3, tail_ms: int = 40) -> int:
-    """Scan backward to find where speech energy ends."""
+                     frame_ms: int = 10, thresh: float = 0.008,
+                     need: int = 4, tail_ms: int = 10) -> int:
+    """Scan backward to find where speech energy ends.
+
+    Aggressive: only keeps 10 ms of post-speech tail.
+    """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
     for s in range(len(wav) - fl, 0, -fl):
@@ -219,9 +226,9 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
         trimmed = wav[start:end]
 
     out = trimmed.copy()
-    # 30 ms fade-in / fade-out to avoid hard clicks at the edges
-    n_in = min(int(sr * 0.030), len(out))
-    n_out = min(int(sr * 0.030), len(out))
+    # 50 ms fade-in / 40 ms fade-out to smooth the edges cleanly
+    n_in = min(int(sr * 0.050), len(out))
+    n_out = min(int(sr * 0.040), len(out))
     if n_in > 0:
         out[:n_in] *= np.linspace(0, 1, n_in, dtype=np.float32)
     if n_out > 0:
