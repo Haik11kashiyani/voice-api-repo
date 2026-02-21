@@ -27,7 +27,11 @@ COPY --chown=user . .
 # Open the default Hugging Face API port
 EXPOSE 7860
 
-# Override the base image's default entrypoint ("tts") 
+# Let Docker / HF know when the container is healthy
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
+
+# Override the base image's default entrypoint ("tts")
 # so that it runs our FastAPI server instead.
 ENTRYPOINT []
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
