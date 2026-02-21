@@ -24,11 +24,11 @@ MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "2000"))
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 # ── XTTS v2 generation parameters ────────────────────────────────────────
-TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.22"))
+TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.20"))
 TOP_K = int(os.getenv("TTS_TOP_K", "50"))
-TOP_P = float(os.getenv("TTS_TOP_P", "0.92"))
+TOP_P = float(os.getenv("TTS_TOP_P", "0.90"))
 REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.4"))
-SPEED = float(os.getenv("TTS_SPEED", "0.99"))
+SPEED = float(os.getenv("TTS_SPEED", "1.01"))
 
 # Generate N candidates for the FULL text, pick the cleanest one
 NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "6"))
@@ -167,11 +167,12 @@ def _score(wav: np.ndarray, ref_env: np.ndarray | None, sr: int) -> float:
 # ── Minimal cleanup: trim silence + fade edges ───────────────────────────
 
 def _find_speech_start(wav: np.ndarray, sr: int,
-                       frame_ms: int = 8, thresh: float = 0.006,
-                       need: int = 4, back_ms: int = 12) -> int:
+                       frame_ms: int = 8, thresh: float = 0.007,
+                       need: int = 3, back_ms: int = 4) -> int:
     """Scan forward to find where speech energy begins.
 
-    Keeps ~12 ms pre-speech padding to avoid cutting leading consonants.
+    Faster attack: 3 consecutive frames, slightly higher threshold,
+    minimal (~4 ms) pre-speech padding.
     """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
@@ -188,11 +189,11 @@ def _find_speech_start(wav: np.ndarray, sr: int,
 
 
 def _find_speech_end(wav: np.ndarray, sr: int,
-                     frame_ms: int = 8, thresh: float = 0.006,
-                     need: int = 4, tail_ms: int = 22) -> int:
+                     frame_ms: int = 8, thresh: float = 0.007,
+                     need: int = 3, tail_ms: int = 18) -> int:
     """Scan backward to find where speech energy ends.
 
-    Keeps a short 22 ms tail so vowels decay naturally.
+    Slightly firmer cutoff with ~18 ms tail.
     """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
@@ -221,9 +222,9 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
         trimmed = wav[start:end]
 
     out = trimmed.copy()
-    # 80 ms fade-in / 60 ms fade-out to smooth the edges cleanly
-    n_in = min(int(sr * 0.080), len(out))
-    n_out = min(int(sr * 0.060), len(out))
+    # 30 ms fade-in / 50 ms fade-out to keep the attack crisp but tails smooth
+    n_in = min(int(sr * 0.030), len(out))
+    n_out = min(int(sr * 0.050), len(out))
     if n_in > 0:
         out[:n_in] *= np.linspace(0, 1, n_in, dtype=np.float32)
     if n_out > 0:
