@@ -24,14 +24,24 @@ MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "2000"))
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 # ── XTTS v2 generation parameters ────────────────────────────────────────
-TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.20"))
+TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.2"))
 TOP_K = int(os.getenv("TTS_TOP_K", "50"))
 TOP_P = float(os.getenv("TTS_TOP_P", "0.90"))
-REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.4"))
-SPEED = float(os.getenv("TTS_SPEED", "1.01"))
+REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.5"))
+SPEED = float(os.getenv("TTS_SPEED", "0.97"))
+
+# XTTS v2 voice conditioning — longer = better voice match
+# gpt_cond_len: how many seconds of reference audio to condition on (max ~30)
+# gpt_cond_chunk_len: processing chunk size for the conditioning
+GPT_COND_LEN = int(os.getenv("TTS_GPT_COND_LEN", "24"))
+GPT_COND_CHUNK_LEN = int(os.getenv("TTS_GPT_COND_CHUNK_LEN", "6"))
 
 # Generate N candidates for the FULL text, pick the cleanest one
-NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "6"))
+NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "5"))
+
+# XTTS v2 always produces a warm-up artifact at the start (distorted first
+# few phonemes). Hard-cut this many milliseconds BEFORE energy-based trimming.
+START_CUT_MS = int(os.getenv("TTS_START_CUT_MS", "180"))
 
 # XTTS v2 native sample rate
 OUTPUT_SR = 24000
@@ -142,37 +152,39 @@ def _glitch_penalty(wav: np.ndarray, sr: int, frame_ms: float = 10.0) -> float:
         return 0.0
     rms = np.array([float(np.sqrt(np.mean(wav[i*fl:(i+1)*fl] ** 2)))
                      for i in range(nf)])
+    # Z-score of frame-to-frame jumps — large spikes indicate glitches
     d = np.abs(np.diff(rms))
     if d.std() < 1e-10:
         return 0.0
     z = (d - d.mean()) / (d.std() + 1e-10)
-    n_bad = int(np.sum(z > 4.0))  # only penalize very strong spikes
-    return float(np.clip(n_bad / max(nf, 1) * 15.0, 0.0, 1.0))
+    # Count frames with z > 3 (severe spike)
+    n_bad = int(np.sum(z > 3.0))
+    return float(np.clip(n_bad / max(nf, 1) * 20.0, 0.0, 1.0))
 
 
 def _score(wav: np.ndarray, ref_env: np.ndarray | None, sr: int) -> float:
     """Combined quality score (higher = better).
 
-    35 % voice similarity  +  45 % smoothness  +  20 % (1 − glitch penalty)
+    40 % voice similarity  +  30 % smoothness  +  30 % (1 − glitch penalty)
     """
     sm = _smoothness(wav, sr)
     gp = _glitch_penalty(wav, sr)
     if ref_env is None:
-        return 0.6 * sm + 0.4 * (1.0 - gp)
+        return 0.5 * sm + 0.5 * (1.0 - gp)
     env = _mel_envelope(wav, sr)
     sim = _cosine_sim(ref_env, env)
-    return 0.35 * sim + 0.45 * sm + 0.20 * (1.0 - gp)
+    return 0.4 * sim + 0.3 * sm + 0.3 * (1.0 - gp)
 
 
 # ── Minimal cleanup: trim silence + fade edges ───────────────────────────
 
 def _find_speech_start(wav: np.ndarray, sr: int,
-                       frame_ms: int = 8, thresh: float = 0.007,
-                       need: int = 3, back_ms: int = 4) -> int:
+                       frame_ms: int = 8, thresh: float = 0.006,
+                       need: int = 4, back_ms: int = 6) -> int:
     """Scan forward to find where speech energy begins.
 
-    Faster attack: 3 consecutive frames, slightly higher threshold,
-    minimal (~4 ms) pre-speech padding.
+    Slightly aggressive: 4 consecutive frames above threshold,
+    ~6 ms pre-speech padding.
     """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
@@ -189,11 +201,11 @@ def _find_speech_start(wav: np.ndarray, sr: int,
 
 
 def _find_speech_end(wav: np.ndarray, sr: int,
-                     frame_ms: int = 8, thresh: float = 0.007,
-                     need: int = 3, tail_ms: int = 18) -> int:
+                     frame_ms: int = 8, thresh: float = 0.006,
+                     need: int = 4, tail_ms: int = 15) -> int:
     """Scan backward to find where speech energy ends.
 
-    Slightly firmer cutoff with ~18 ms tail.
+    Allows a small 15 ms tail to keep natural decay.
     """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
@@ -210,10 +222,20 @@ def _find_speech_end(wav: np.ndarray, sr: int,
 
 
 def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
-    """Trim leading/trailing silence  →  apply gentle fade-in / fade-out.
+    """Clean up raw TTS output:
 
-    This is the ONLY modification applied to the raw TTS output.
+    1. Hard-cut the first START_CUT_MS (removes XTTS warm-up artifact)
+    2. Energy-based silence trim (start & end)
+    3. Gentle fade-in / fade-out
+
+    Nothing else is modified.
     """
+    # Step 1 — hard-cut the warm-up artifact at the very start
+    hard_cut = int(sr * START_CUT_MS / 1000)
+    if hard_cut < len(wav):
+        wav = wav[hard_cut:]
+
+    # Step 2 — energy-based silence trim
     start = _find_speech_start(wav, sr)
     end = _find_speech_end(wav, sr)
     if start >= end:
@@ -221,10 +243,10 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
     else:
         trimmed = wav[start:end]
 
+    # Step 3 — fade edges
     out = trimmed.copy()
-    # 30 ms fade-in / 50 ms fade-out to keep the attack crisp but tails smooth
-    n_in = min(int(sr * 0.030), len(out))
-    n_out = min(int(sr * 0.050), len(out))
+    n_in = min(int(sr * 0.060), len(out))   # 60 ms fade-in
+    n_out = min(int(sr * 0.050), len(out))  # 50 ms fade-out
     if n_in > 0:
         out[:n_in] *= np.linspace(0, 1, n_in, dtype=np.float32)
     if n_out > 0:
@@ -237,7 +259,10 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
-    """Single TTS call → float32 waveform (no post-processing yet)."""
+    """Single TTS call → float32 waveform (no post-processing yet).
+
+    Passes XTTS v2-specific conditioning params for deeper voice cloning.
+    """
     wav = model.tts(
         text=text,
         speaker_wav=samples,
@@ -247,6 +272,9 @@ def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
         top_p=TOP_P,
         repetition_penalty=REPETITION_PENALTY,
         speed=SPEED,
+        # XTTS v2 deep conditioning — use more reference audio
+        gpt_cond_len=GPT_COND_LEN,
+        gpt_cond_chunk_len=GPT_COND_CHUNK_LEN,
     )
     return np.array(wav, dtype=np.float32)
 
