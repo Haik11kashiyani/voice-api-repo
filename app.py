@@ -33,8 +33,13 @@ SPEED = float(os.getenv("TTS_SPEED", "1.0"))                     # 1.0 = normal 
 # Best-of-N: generate N candidates, return the one closest to your voice
 NUM_CANDIDATES = int(os.getenv("TTS_NUM_CANDIDATES", "3"))
 
-# Post-processing: trim initial jitter
-TRIM_START_SEC = float(os.getenv("TRIM_START_SEC", "0.35"))      # seconds to cut from the beginning
+# Warm-up prefix: a throwaway sentence spoken before the real text.
+# The audio for this prefix is measured and cut off, so the model's
+# start-of-sequence jitter never reaches the final output.
+WARMUP_PREFIX = "One moment please. "
+
+# Fade-in duration (seconds) applied after trimming to smooth any remaining edge
+FADE_IN_SEC = float(os.getenv("FADE_IN_SEC", "0.08"))
 
 # XTTS v2 output sample rate
 OUTPUT_SR = 24000
@@ -145,6 +150,42 @@ def _trim_start_array(waveform: np.ndarray, sr: int, trim_sec: float) -> np.ndar
     return waveform[frames_to_skip:]
 
 
+def _fade_in(waveform: np.ndarray, sr: int, duration_sec: float) -> np.ndarray:
+    """Apply a smooth fade-in over the first *duration_sec* seconds."""
+    if duration_sec <= 0:
+        return waveform
+    n_samples = min(int(sr * duration_sec), len(waveform))
+    fade = np.linspace(0.0, 1.0, n_samples, dtype=np.float32)
+    out = waveform.copy()
+    out[:n_samples] *= fade
+    return out
+
+
+def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
+    """Run TTS for *text* and return the waveform as a float32 array."""
+    wav_list = model.tts(
+        text=text,
+        speaker_wav=samples,
+        language="en",
+        temperature=TEMPERATURE,
+        top_k=TOP_K,
+        top_p=TOP_P,
+        repetition_penalty=REPETITION_PENALTY,
+        speed=SPEED,
+    )
+    return np.array(wav_list, dtype=np.float32)
+
+
+def _measure_warmup_duration(model: TTS, samples: list[str]) -> float:
+    """Generate the warm-up prefix in isolation and return its duration in seconds.
+
+    Called once at startup so we know exactly how many samples to cut.
+    """
+    wav = _generate_one(model, WARMUP_PREFIX, samples)
+    duration = len(wav) / OUTPUT_SR
+    return duration
+
+
 # ---------------------------------------------------------------------------
 # Voice sample collection
 # ---------------------------------------------------------------------------
@@ -174,11 +215,12 @@ def _collect_voice_samples() -> list[str]:
 tts_model: TTS | None = None
 voice_samples: list[str] = []
 ref_envelope: np.ndarray | None = None
+warmup_duration: float = 0.0          # measured at startup
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_model, voice_samples, ref_envelope
+    global tts_model, voice_samples, ref_envelope, warmup_duration
     os.makedirs(TMP_DIR, exist_ok=True)
 
     voice_samples = _collect_voice_samples()
@@ -192,6 +234,15 @@ async def lifespan(app: FastAPI):
     logger.info("Loading TTS model '%s' …", MODEL_NAME)
     tts_model = TTS(MODEL_NAME).to("cpu")
     logger.info("Model loaded and ready.")
+
+    # Measure warm-up prefix duration so we can trim it precisely later
+    if voice_samples:
+        logger.info("Measuring warm-up prefix duration …")
+        warmup_duration = _measure_warmup_duration(tts_model, voice_samples)
+        # Add a small safety margin so we don't leave any prefix residue
+        warmup_duration += 0.15
+        logger.info("Warm-up prefix duration: %.2fs (with margin).", warmup_duration)
+
     yield
     logger.info("Shutting down.")
 
@@ -276,20 +327,13 @@ def generate_audio(request: TextRequest):
         TEMPERATURE, TOP_K, TOP_P, REPETITION_PENALTY, SPEED,
     )
 
+    # Build the full text with warm-up prefix so jitter lands on the throwaway part
+    full_text = WARMUP_PREFIX + request.text
+
     candidates: list[np.ndarray] = []
     for i in range(NUM_CANDIDATES):
         try:
-            wav_list = tts_model.tts(
-                text=request.text,
-                speaker_wav=voice_samples,
-                language="en",
-                temperature=TEMPERATURE,
-                top_k=TOP_K,
-                top_p=TOP_P,
-                repetition_penalty=REPETITION_PENALTY,
-                speed=SPEED,
-            )
-            wav_arr = np.array(wav_list, dtype=np.float32)
+            wav_arr = _generate_one(tts_model, full_text, voice_samples)
             candidates.append(wav_arr)
             logger.info("  Candidate %d/%d generated (%d samples).", i + 1, NUM_CANDIDATES, len(wav_arr))
         except Exception as exc:
@@ -315,9 +359,12 @@ def generate_audio(request: TextRequest):
         best_wav = candidates[best_idx]
         logger.info("Selected candidate %d (score %.4f).", best_idx + 1, best_score)
 
-    # --- post-processing --------------------------------------------------
-    best_wav = _trim_start_array(best_wav, OUTPUT_SR, TRIM_START_SEC)
-    logger.info("Trimmed first %.2fs.", TRIM_START_SEC)
+    # --- post-processing: cut warm-up prefix + fade-in --------------------
+    best_wav = _trim_start_array(best_wav, OUTPUT_SR, warmup_duration)
+    logger.info("Trimmed warm-up prefix (%.2fs).", warmup_duration)
+
+    best_wav = _fade_in(best_wav, OUTPUT_SR, FADE_IN_SEC)
+    logger.info("Applied %.0fms fade-in.", FADE_IN_SEC * 1000)
 
     # --- save & return ----------------------------------------------------
     filename = f"{uuid.uuid4().hex}.wav"
