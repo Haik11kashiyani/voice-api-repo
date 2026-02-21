@@ -24,17 +24,15 @@ MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "2000"))
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 # ── XTTS v2 generation parameters ────────────────────────────────────────
-TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.2"))
+TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.35"))
 TOP_K = int(os.getenv("TTS_TOP_K", "50"))
-TOP_P = float(os.getenv("TTS_TOP_P", "0.90"))
+TOP_P = float(os.getenv("TTS_TOP_P", "0.85"))
 REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.5"))
-SPEED = float(os.getenv("TTS_SPEED", "0.97"))
+SPEED = float(os.getenv("TTS_SPEED", "1.0"))
 
-# XTTS v2 voice conditioning — longer = better voice match
-# gpt_cond_len: how many seconds of reference audio to condition on (max ~30)
-# gpt_cond_chunk_len: processing chunk size for the conditioning
-GPT_COND_LEN = int(os.getenv("TTS_GPT_COND_LEN", "24"))
-GPT_COND_CHUNK_LEN = int(os.getenv("TTS_GPT_COND_CHUNK_LEN", "6"))
+# XTTS v2 voice conditioning — how many seconds of reference audio to use
+GPT_COND_LEN = int(os.getenv("TTS_GPT_COND_LEN", "12"))
+GPT_COND_CHUNK_LEN = int(os.getenv("TTS_GPT_COND_CHUNK_LEN", "4"))
 
 # Generate N candidates for the FULL text, pick the cleanest one
 NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "5"))
@@ -262,6 +260,7 @@ def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
     """Single TTS call → float32 waveform (no post-processing yet).
 
     Passes XTTS v2-specific conditioning params for deeper voice cloning.
+    enable_text_splitting gives consistent pacing across sentences.
     """
     wav = model.tts(
         text=text,
@@ -272,9 +271,9 @@ def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
         top_p=TOP_P,
         repetition_penalty=REPETITION_PENALTY,
         speed=SPEED,
-        # XTTS v2 deep conditioning — use more reference audio
         gpt_cond_len=GPT_COND_LEN,
         gpt_cond_chunk_len=GPT_COND_CHUNK_LEN,
+        enable_text_splitting=True,
     )
     return np.array(wav, dtype=np.float32)
 
