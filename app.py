@@ -24,14 +24,14 @@ MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "2000"))
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 # ── XTTS v2 generation parameters ────────────────────────────────────────
-TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.25"))
+TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.22"))
 TOP_K = int(os.getenv("TTS_TOP_K", "50"))
-TOP_P = float(os.getenv("TTS_TOP_P", "0.90"))
+TOP_P = float(os.getenv("TTS_TOP_P", "0.92"))
 REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.4"))
-SPEED = float(os.getenv("TTS_SPEED", "0.98"))
+SPEED = float(os.getenv("TTS_SPEED", "0.99"))
 
 # Generate N candidates for the FULL text, pick the cleanest one
-NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "5"))
+NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "6"))
 
 # XTTS v2 native sample rate
 OUTPUT_SR = 24000
@@ -142,39 +142,36 @@ def _glitch_penalty(wav: np.ndarray, sr: int, frame_ms: float = 10.0) -> float:
         return 0.0
     rms = np.array([float(np.sqrt(np.mean(wav[i*fl:(i+1)*fl] ** 2)))
                      for i in range(nf)])
-    # Z-score of frame-to-frame jumps — large spikes indicate glitches
     d = np.abs(np.diff(rms))
     if d.std() < 1e-10:
         return 0.0
     z = (d - d.mean()) / (d.std() + 1e-10)
-    # Count frames with z > 3 (severe spike)
-    n_bad = int(np.sum(z > 3.0))
-    return float(np.clip(n_bad / max(nf, 1) * 20.0, 0.0, 1.0))
+    n_bad = int(np.sum(z > 4.0))  # only penalize very strong spikes
+    return float(np.clip(n_bad / max(nf, 1) * 15.0, 0.0, 1.0))
 
 
 def _score(wav: np.ndarray, ref_env: np.ndarray | None, sr: int) -> float:
     """Combined quality score (higher = better).
 
-    40 % voice similarity  +  30 % smoothness  +  30 % (1 − glitch penalty)
+    35 % voice similarity  +  45 % smoothness  +  20 % (1 − glitch penalty)
     """
     sm = _smoothness(wav, sr)
     gp = _glitch_penalty(wav, sr)
     if ref_env is None:
-        return 0.5 * sm + 0.5 * (1.0 - gp)
+        return 0.6 * sm + 0.4 * (1.0 - gp)
     env = _mel_envelope(wav, sr)
     sim = _cosine_sim(ref_env, env)
-    return 0.4 * sim + 0.3 * sm + 0.3 * (1.0 - gp)
+    return 0.35 * sim + 0.45 * sm + 0.20 * (1.0 - gp)
 
 
 # ── Minimal cleanup: trim silence + fade edges ───────────────────────────
 
 def _find_speech_start(wav: np.ndarray, sr: int,
                        frame_ms: int = 8, thresh: float = 0.006,
-                       need: int = 4, back_ms: int = 6) -> int:
+                       need: int = 4, back_ms: int = 12) -> int:
     """Scan forward to find where speech energy begins.
 
-    Slightly aggressive: 4 consecutive frames above threshold,
-    ~6 ms pre-speech padding.
+    Keeps ~12 ms pre-speech padding to avoid cutting leading consonants.
     """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
@@ -192,10 +189,10 @@ def _find_speech_start(wav: np.ndarray, sr: int,
 
 def _find_speech_end(wav: np.ndarray, sr: int,
                      frame_ms: int = 8, thresh: float = 0.006,
-                     need: int = 4, tail_ms: int = 15) -> int:
+                     need: int = 4, tail_ms: int = 22) -> int:
     """Scan backward to find where speech energy ends.
 
-    Allows a small 15 ms tail to keep natural decay.
+    Keeps a short 22 ms tail so vowels decay naturally.
     """
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
@@ -224,9 +221,9 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
         trimmed = wav[start:end]
 
     out = trimmed.copy()
-    # 60 ms fade-in / 50 ms fade-out to smooth the edges cleanly
-    n_in = min(int(sr * 0.060), len(out))
-    n_out = min(int(sr * 0.050), len(out))
+    # 80 ms fade-in / 60 ms fade-out to smooth the edges cleanly
+    n_in = min(int(sr * 0.080), len(out))
+    n_out = min(int(sr * 0.060), len(out))
     if n_in > 0:
         out[:n_in] *= np.linspace(0, 1, n_in, dtype=np.float32)
     if n_out > 0:
