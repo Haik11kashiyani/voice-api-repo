@@ -24,10 +24,10 @@ MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "2000"))
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 # XTTS v2 generation tuning
-TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.15"))
-TOP_K = int(os.getenv("TTS_TOP_K", "30"))
-TOP_P = float(os.getenv("TTS_TOP_P", "0.75"))
-REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "5.0"))
+TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.2"))
+TOP_K = int(os.getenv("TTS_TOP_K", "50"))
+TOP_P = float(os.getenv("TTS_TOP_P", "0.85"))
+REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.0"))
 SPEED = float(os.getenv("TTS_SPEED", "1.0"))
 
 # Best-of-N: generate N candidates, pick the closest to reference voice
@@ -181,13 +181,127 @@ def _fade_in(waveform: np.ndarray, sr: int, duration_ms: float) -> np.ndarray:
     return out
 
 
-def _clean_start(waveform: np.ndarray, sr: int) -> np.ndarray:
-    """Trim any leading jitter/noise and apply a gentle fade-in."""
+def _remove_clicks(waveform: np.ndarray, sr: int,
+                   window_ms: float = 2.0, threshold: float = 6.0) -> np.ndarray:
+    """Remove click/pop artifacts by smoothing sudden amplitude spikes.
+
+    Scans in tiny windows.  If a window's peak is *threshold* times larger
+    than the local average (computed over a wider neighbourhood), the spike
+    is replaced with linearly-interpolated values from the neighbours.
+    """
+    out = waveform.copy()
+    win = max(1, int(sr * window_ms / 1000))
+    neighbourhood = win * 8  # wider context to compute local average
+
+    for start in range(0, len(out) - win, win):
+        chunk = out[start: start + win]
+        peak = float(np.max(np.abs(chunk)))
+
+        # compute local average energy around this window
+        ctx_start = max(0, start - neighbourhood)
+        ctx_end = min(len(out), start + win + neighbourhood)
+        ctx = out[ctx_start: ctx_end]
+        local_avg = float(np.mean(np.abs(ctx))) + 1e-10
+
+        if peak > threshold * local_avg:
+            # interpolate from edges
+            left_val = out[max(0, start - 1)]
+            right_val = out[min(len(out) - 1, start + win)]
+            out[start: start + win] = np.linspace(left_val, right_val, win)
+
+    return out
+
+
+def _repair_dropouts(waveform: np.ndarray, sr: int,
+                     frame_ms: float = 10.0,
+                     silence_threshold: float = 0.001,
+                     max_gap_ms: float = 120.0) -> np.ndarray:
+    """Fill in short unexpected silence gaps (dropouts) in the middle of speech.
+
+    If a silent segment shorter than *max_gap_ms* appears **between** two
+    voiced regions, we crossfade over it to remove the glitchy pause.
+    """
+    out = waveform.copy()
+    frame_len = max(1, int(sr * frame_ms / 1000))
+    max_gap_frames = int(max_gap_ms / frame_ms)
+
+    # compute per-frame RMS
+    n_frames = len(out) // frame_len
+    rms = np.zeros(n_frames)
+    for i in range(n_frames):
+        chunk = out[i * frame_len: (i + 1) * frame_len]
+        rms[i] = float(np.sqrt(np.mean(chunk ** 2)))
+
+    is_silent = rms < silence_threshold
+
+    i = 0
+    while i < n_frames:
+        if is_silent[i]:
+            gap_start = i
+            while i < n_frames and is_silent[i]:
+                i += 1
+            gap_end = i  # first non-silent frame after gap
+            gap_len = gap_end - gap_start
+
+            # Only repair short gaps that are surrounded by speech (not leading/trailing)
+            if 0 < gap_start and gap_end < n_frames and gap_len <= max_gap_frames:
+                # Crossfade: linearly interpolate samples across the gap
+                s = gap_start * frame_len
+                e = min(gap_end * frame_len, len(out))
+                left_val = out[max(0, s - 1)]
+                right_val = out[min(len(out) - 1, e)]
+                n = e - s
+                if n > 0:
+                    out[s:e] = np.linspace(left_val, right_val, n, dtype=np.float32)
+        else:
+            i += 1
+
+    return out
+
+
+def _smoothness_score(waveform: np.ndarray, sr: int, frame_ms: float = 10.0) -> float:
+    """Score how smooth/consistent the energy curve is (higher = smoother).
+
+    Returns a value between 0 and 1.  Audio with sudden energy jumps
+    (glitches, clicks, dropouts) scores lower.
+    """
+    frame_len = max(1, int(sr * frame_ms / 1000))
+    n_frames = len(waveform) // frame_len
+    if n_frames < 3:
+        return 1.0
+
+    rms = np.zeros(n_frames)
+    for i in range(n_frames):
+        chunk = waveform[i * frame_len: (i + 1) * frame_len]
+        rms[i] = float(np.sqrt(np.mean(chunk ** 2)))
+
+    # normalized first-difference of energy curve
+    diffs = np.abs(np.diff(rms))
+    mean_rms = float(np.mean(rms)) + 1e-10
+    normalized_diffs = diffs / mean_rms
+
+    # smoothness = inverse of average jump magnitude (clamped to 0-1)
+    avg_jump = float(np.mean(normalized_diffs))
+    return float(np.clip(1.0 / (1.0 + avg_jump * 5.0), 0.0, 1.0))
+
+
+def _clean_audio(waveform: np.ndarray, sr: int) -> np.ndarray:
+    """Full post-processing pipeline: trim start → remove clicks → repair dropouts → fade-in."""
+    # 1. Trim leading jitter
     cut = _find_speech_start(waveform, sr)
     if cut > 0:
         logger.info("  Trimming %d leading samples (%.3fs of jitter).", cut, cut / sr)
         waveform = waveform[cut:]
+
+    # 2. Remove click/pop spikes
+    waveform = _remove_clicks(waveform, sr)
+
+    # 3. Repair mid-speech silence dropouts
+    waveform = _repair_dropouts(waveform, sr)
+
+    # 4. Smooth fade-in
     waveform = _fade_in(waveform, sr, FADE_IN_MS)
+
     return waveform
 
 
@@ -329,7 +443,7 @@ def generate_audio(request: TextRequest):
     for i in range(NUM_CANDIDATES):
         try:
             wav = _generate_one(tts_model, request.text, voice_samples)
-            wav = _clean_start(wav, OUTPUT_SR)
+            wav = _clean_audio(wav, OUTPUT_SR)       # full post-processing pipeline
             candidates.append(wav)
             logger.info("  Candidate %d/%d — %d samples (%.2fs), cleaned.",
                         i + 1, NUM_CANDIDATES, len(wav), len(wav) / OUTPUT_SR)
@@ -340,18 +454,22 @@ def generate_audio(request: TextRequest):
         raise HTTPException(status_code=500, detail="All generation attempts failed.")
 
     # --- pick the best candidate ------------------------------------------
+    # Combined score: 70% voice similarity + 30% smoothness (penalise glitchy audio)
     if len(candidates) == 1 or ref_envelope is None:
         best_wav = candidates[0]
     else:
-        best_idx, best_score = 0, -1.0
+        best_idx, best_combined = 0, -1.0
         for i, cand in enumerate(candidates):
             env = _mel_envelope(cand, OUTPUT_SR)
-            score = _cosine_sim(ref_envelope, env)
-            logger.info("  Candidate %d similarity: %.4f", i + 1, score)
-            if score > best_score:
-                best_score, best_idx = score, i
+            sim = _cosine_sim(ref_envelope, env)
+            smooth = _smoothness_score(cand, OUTPUT_SR)
+            combined = 0.7 * sim + 0.3 * smooth
+            logger.info("  Candidate %d  similarity=%.4f  smoothness=%.4f  combined=%.4f",
+                        i + 1, sim, smooth, combined)
+            if combined > best_combined:
+                best_combined, best_idx = combined, i
         best_wav = candidates[best_idx]
-        logger.info("Selected candidate %d (score %.4f).", best_idx + 1, best_score)
+        logger.info("Selected candidate %d (combined %.4f).", best_idx + 1, best_combined)
 
     # --- save & return ----------------------------------------------------
     filename = f"{uuid.uuid4().hex}.wav"
