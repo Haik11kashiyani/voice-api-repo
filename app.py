@@ -5,6 +5,7 @@ import wave
 import logging
 from contextlib import asynccontextmanager
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -29,8 +30,14 @@ TOP_P = float(os.getenv("TTS_TOP_P", "0.75"))                    # nucleus sampl
 REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "5.0"))  # avoid repetition glitches
 SPEED = float(os.getenv("TTS_SPEED", "1.0"))                     # 1.0 = normal speed
 
+# Best-of-N: generate N candidates, return the one closest to your voice
+NUM_CANDIDATES = int(os.getenv("TTS_NUM_CANDIDATES", "3"))
+
 # Post-processing: trim initial jitter
 TRIM_START_SEC = float(os.getenv("TRIM_START_SEC", "0.35"))      # seconds to cut from the beginning
+
+# XTTS v2 output sample rate
+OUTPUT_SR = 24000
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -42,7 +49,104 @@ logging.basicConfig(
 logger = logging.getLogger("voice-api")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+def _load_wav_as_float(wav_path: str) -> np.ndarray:
+    """Load a WAV file and return a mono float32 numpy array in [-1, 1]."""
+    with wave.open(wav_path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    if sampwidth == 2:
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sampwidth == 4:
+        samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+
+    # Mix to mono if stereo
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+    return samples
+
+
+def _mel_envelope(signal: np.ndarray, sr: int, n_fft: int = 2048, n_bands: int = 40) -> np.ndarray:
+    """Compute a mean mel-scale spectral envelope (a compact voice fingerprint)."""
+    hop = n_fft // 2
+    n_hops = max(1, (len(signal) - n_fft) // hop)
+
+    power_sum = np.zeros(n_fft // 2 + 1)
+    window = np.hanning(n_fft)
+    for i in range(n_hops):
+        frame = signal[i * hop: i * hop + n_fft]
+        if len(frame) < n_fft:
+            frame = np.pad(frame, (0, n_fft - len(frame)))
+        spectrum = np.abs(np.fft.rfft(frame * window)) ** 2
+        power_sum += spectrum
+
+    avg_power = power_sum / max(n_hops, 1)
+
+    # Group into mel-spaced bands
+    freqs = np.linspace(0, sr / 2, len(avg_power))
+    mel_freqs = 2595.0 * np.log10(1.0 + freqs / 700.0)
+    mel_edges = np.linspace(mel_freqs[0], mel_freqs[-1], n_bands + 2)
+
+    envelope = np.zeros(n_bands)
+    for b in range(n_bands):
+        mask = (mel_freqs >= mel_edges[b]) & (mel_freqs < mel_edges[b + 2])
+        if mask.any():
+            envelope[b] = np.mean(avg_power[mask])
+
+    return np.log(envelope + 1e-10)
+
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _reference_envelope(sample_paths: list[str], sr: int) -> np.ndarray:
+    """Compute the averaged mel envelope across all reference samples."""
+    envelopes = []
+    for p in sample_paths:
+        sig = _load_wav_as_float(p)
+        envelopes.append(_mel_envelope(sig, sr))
+    return np.mean(envelopes, axis=0)
+
+
+def _save_wav(waveform: np.ndarray, file_path: str, sr: int = OUTPUT_SR) -> None:
+    """Save a float waveform array as a 16-bit mono WAV."""
+    wav = np.array(waveform, dtype=np.float32)
+    peak = np.max(np.abs(wav))
+    if peak > 0:
+        wav = wav / peak * 0.95          # normalise to prevent clipping
+    wav_int16 = (wav * 32767).astype(np.int16)
+
+    with wave.open(file_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(wav_int16.tobytes())
+
+
+def _trim_start_array(waveform: np.ndarray, sr: int, trim_sec: float) -> np.ndarray:
+    """Return the waveform with the first *trim_sec* seconds removed."""
+    if trim_sec <= 0:
+        return waveform
+    frames_to_skip = int(sr * trim_sec)
+    if frames_to_skip >= len(waveform):
+        return waveform
+    return waveform[frames_to_skip:]
+
+
+# ---------------------------------------------------------------------------
+# Voice sample collection
 # ---------------------------------------------------------------------------
 
 def _collect_voice_samples() -> list[str]:
@@ -64,51 +168,24 @@ def _collect_voice_samples() -> list[str]:
     return samples
 
 
-def _trim_start(wav_path: str, trim_sec: float) -> None:
-    """Trim the first *trim_sec* seconds from a WAV file **in-place**.
-
-    This removes the initial jitter / artefacts that XTTS sometimes produces.
-    """
-    if trim_sec <= 0:
-        return
-
-    with wave.open(wav_path, "rb") as rf:
-        params = rf.getparams()
-        n_channels = params.nchannels
-        sampwidth = params.sampwidth
-        framerate = params.framerate
-        n_frames = params.nframes
-        all_data = rf.readframes(n_frames)
-
-    frames_to_skip = int(framerate * trim_sec)
-    if frames_to_skip >= n_frames:
-        return  # nothing left — keep original
-
-    bytes_per_frame = n_channels * sampwidth
-    trimmed_data = all_data[frames_to_skip * bytes_per_frame:]
-
-    with wave.open(wav_path, "wb") as wf:
-        wf.setnchannels(n_channels)
-        wf.setsampwidth(sampwidth)
-        wf.setframerate(framerate)
-        wf.writeframes(trimmed_data)
-
-
 # ---------------------------------------------------------------------------
 # App lifespan — load model once, create temp dir
 # ---------------------------------------------------------------------------
 tts_model: TTS | None = None
 voice_samples: list[str] = []
+ref_envelope: np.ndarray | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_model, voice_samples
+    global tts_model, voice_samples, ref_envelope
     os.makedirs(TMP_DIR, exist_ok=True)
 
     voice_samples = _collect_voice_samples()
     if voice_samples:
         logger.info("Using %d voice sample(s): %s", len(voice_samples), voice_samples)
+        ref_envelope = _reference_envelope(voice_samples, OUTPUT_SR)
+        logger.info("Reference voice envelope computed.")
     else:
         logger.warning("No voice samples found — /generate will fail until at least one .wav is provided.")
 
@@ -125,7 +202,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="My Voice API",
     description="Generate speech audio that sounds like your cloned voice.",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -158,7 +235,7 @@ def read_root():
     return {
         "message": "Welcome to My Voice API! The server is running.",
         "endpoints": {
-            "POST /generate": "Send JSON {'text': '...'} to generate audio.",
+            "POST /generate": "Send JSON {'text': '...'} to generate audio (best-of-N selection).",
             "GET  /health": "Health-check endpoint.",
         },
     }
@@ -174,12 +251,17 @@ def health_check():
         "status": status,
         "model_loaded": model_ready,
         "voice_samples": sample_count,
+        "candidates_per_request": NUM_CANDIDATES,
     }
 
 
 @app.post("/generate")
 def generate_audio(request: TextRequest):
-    """Generate a WAV file spoken in the cloned voice."""
+    """Generate a WAV file spoken in the cloned voice.
+
+    Internally generates NUM_CANDIDATES versions and returns the one whose
+    spectral envelope is closest to the reference voice.
+    """
     # --- pre-flight checks ------------------------------------------------
     if tts_model is None:
         raise HTTPException(status_code=503, detail="TTS model is still loading. Please retry in a moment.")
@@ -187,42 +269,60 @@ def generate_audio(request: TextRequest):
     if not voice_samples:
         raise HTTPException(status_code=500, detail="No voice sample files found on the server.")
 
-    # --- generate audio ---------------------------------------------------
-    # Unique filename per request avoids race conditions under concurrency
-    filename = f"{uuid.uuid4().hex}.wav"
-    output_path = os.path.join(TMP_DIR, filename)
-
-    logger.info("Generating audio for %d chars of text …", len(request.text))
+    # --- generate N candidates --------------------------------------------
     logger.info(
-        "Params: temperature=%.2f  top_k=%d  top_p=%.2f  rep_penalty=%.1f  speed=%.1f",
+        "Generating %d candidate(s) for %d chars | temp=%.2f  top_k=%d  top_p=%.2f  rep=%.1f  speed=%.1f",
+        NUM_CANDIDATES, len(request.text),
         TEMPERATURE, TOP_K, TOP_P, REPETITION_PENALTY, SPEED,
     )
 
-    try:
-        tts_model.tts_to_file(
-            text=request.text,
-            speaker_wav=voice_samples,
-            language="en",
-            file_path=output_path,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-            top_p=TOP_P,
-            repetition_penalty=REPETITION_PENALTY,
-            speed=SPEED,
-        )
-    except Exception as exc:
-        logger.exception("TTS generation failed.")
-        raise HTTPException(status_code=500, detail=f"Audio generation failed: {exc}") from exc
+    candidates: list[np.ndarray] = []
+    for i in range(NUM_CANDIDATES):
+        try:
+            wav_list = tts_model.tts(
+                text=request.text,
+                speaker_wav=voice_samples,
+                language="en",
+                temperature=TEMPERATURE,
+                top_k=TOP_K,
+                top_p=TOP_P,
+                repetition_penalty=REPETITION_PENALTY,
+                speed=SPEED,
+            )
+            wav_arr = np.array(wav_list, dtype=np.float32)
+            candidates.append(wav_arr)
+            logger.info("  Candidate %d/%d generated (%d samples).", i + 1, NUM_CANDIDATES, len(wav_arr))
+        except Exception as exc:
+            logger.warning("  Candidate %d/%d failed: %s", i + 1, NUM_CANDIDATES, exc)
 
-    if not os.path.isfile(output_path):
-        raise HTTPException(status_code=500, detail="Audio file was not created.")
+    if not candidates:
+        raise HTTPException(status_code=500, detail="All generation attempts failed.")
 
-    # --- post-processing: trim jittery start ------------------------------
-    try:
-        _trim_start(output_path, TRIM_START_SEC)
-        logger.info("Trimmed first %.2fs from output.", TRIM_START_SEC)
-    except Exception:
-        logger.warning("Post-processing trim failed — returning untrimmed audio.", exc_info=True)
+    # --- pick the best candidate ------------------------------------------
+    if len(candidates) == 1 or ref_envelope is None:
+        best_wav = candidates[0]
+        logger.info("Using the only available candidate.")
+    else:
+        best_idx = 0
+        best_score = -1.0
+        for i, cand in enumerate(candidates):
+            cand_env = _mel_envelope(cand, OUTPUT_SR)
+            score = _cosine_sim(ref_envelope, cand_env)
+            logger.info("  Candidate %d similarity: %.4f", i + 1, score)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        best_wav = candidates[best_idx]
+        logger.info("Selected candidate %d (score %.4f).", best_idx + 1, best_score)
+
+    # --- post-processing --------------------------------------------------
+    best_wav = _trim_start_array(best_wav, OUTPUT_SR, TRIM_START_SEC)
+    logger.info("Trimmed first %.2fs.", TRIM_START_SEC)
+
+    # --- save & return ----------------------------------------------------
+    filename = f"{uuid.uuid4().hex}.wav"
+    output_path = os.path.join(TMP_DIR, filename)
+    _save_wav(best_wav, output_path, OUTPUT_SR)
 
     logger.info("Audio saved → %s", output_path)
     return FileResponse(output_path, media_type="audio/wav", filename="output.wav")
