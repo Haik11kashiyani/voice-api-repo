@@ -1,5 +1,4 @@
 import os
-import re
 import glob
 import uuid
 import wave
@@ -24,20 +23,19 @@ TMP_DIR = os.getenv("TMP_DIR", "/tmp/voice_api")
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "2000"))
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
-# XTTS v2 generation — use the model's recommended defaults
-TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.65"))
+# ── XTTS v2 generation parameters ────────────────────────────────────────
+# temperature 0.3 = good balance: consistent output without repetition loops
+# (0.15 caused looping; 0.65 was too random / glitchy)
+TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.3"))
 TOP_K = int(os.getenv("TTS_TOP_K", "50"))
 TOP_P = float(os.getenv("TTS_TOP_P", "0.85"))
 REPETITION_PENALTY = float(os.getenv("TTS_REP_PENALTY", "2.0"))
 SPEED = float(os.getenv("TTS_SPEED", "1.0"))
 
-# Per-sentence: generate N takes, pick the smoothest
-TAKES_PER_SENTENCE = int(os.getenv("TTS_TAKES", "2"))
+# Generate N candidates for the FULL text, pick the cleanest one
+NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "4"))
 
-# Crossfade duration between sentences (milliseconds)
-CROSSFADE_MS = int(os.getenv("CROSSFADE_MS", "80"))
-
-# XTTS v2 output sample rate
+# XTTS v2 native sample rate
 OUTPUT_SR = 24000
 
 # ---------------------------------------------------------------------------
@@ -51,10 +49,11 @@ logger = logging.getLogger("voice-api")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Audio utilities (no waveform manipulation — only measurement + assembly)
+# Audio helpers  (read-only measurement + minimal trim/fade — nothing else)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _load_wav_as_float(wav_path: str) -> np.ndarray:
+    """Load any WAV file → mono float32 in [-1, 1]."""
     with wave.open(wav_path, "rb") as wf:
         n_ch = wf.getnchannels()
         sw = wf.getsampwidth()
@@ -73,6 +72,7 @@ def _load_wav_as_float(wav_path: str) -> np.ndarray:
 
 def _mel_envelope(signal: np.ndarray, sr: int,
                   n_fft: int = 2048, n_bands: int = 40) -> np.ndarray:
+    """Compute a rough mel-scale spectral envelope for voice similarity."""
     hop = n_fft // 2
     n_hops = max(1, (len(signal) - n_fft) // hop)
     power_sum = np.zeros(n_fft // 2 + 1)
@@ -102,10 +102,13 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _reference_envelope(paths: list[str], sr: int) -> np.ndarray:
-    return np.mean([_mel_envelope(_load_wav_as_float(p), sr) for p in paths], axis=0)
+    """Average mel envelope across all reference voice samples."""
+    return np.mean([_mel_envelope(_load_wav_as_float(p), sr) for p in paths],
+                   axis=0)
 
 
 def _save_wav(wav: np.ndarray, path: str, sr: int = OUTPUT_SR) -> None:
+    """Normalize to −0.95 … +0.95 and write 16-bit WAV."""
     w = np.array(wav, dtype=np.float32)
     peak = np.max(np.abs(w))
     if peak > 0:
@@ -118,35 +121,59 @@ def _save_wav(wav: np.ndarray, path: str, sr: int = OUTPUT_SR) -> None:
         wf.writeframes(w16.tobytes())
 
 
-# ── Quality measurement (read-only — never modifies audio) ───────────────
+# ── Quality scoring (never modifies the waveform) ────────────────────────
 
 def _smoothness(wav: np.ndarray, sr: int, frame_ms: float = 10.0) -> float:
-    """1.0 = perfectly smooth energy curve, 0.0 = very glitchy."""
+    """Score 0-1: how smooth the energy envelope is (1 = smooth, 0 = glitchy)."""
     fl = max(1, int(sr * frame_ms / 1000))
     nf = len(wav) // fl
     if nf < 3:
         return 1.0
-    rms = np.array([float(np.sqrt(np.mean(wav[i*fl:(i+1)*fl] ** 2))) for i in range(nf)])
+    rms = np.array([float(np.sqrt(np.mean(wav[i*fl:(i+1)*fl] ** 2)))
+                     for i in range(nf)])
     d = np.abs(np.diff(rms))
     m = float(np.mean(rms)) + 1e-10
     return float(np.clip(1.0 / (1.0 + np.mean(d / m) * 5.0), 0.0, 1.0))
 
 
+def _glitch_penalty(wav: np.ndarray, sr: int, frame_ms: float = 10.0) -> float:
+    """Penalize sudden energy spikes (clicks / pops).  0 = no glitches, 1 = terrible."""
+    fl = max(1, int(sr * frame_ms / 1000))
+    nf = len(wav) // fl
+    if nf < 5:
+        return 0.0
+    rms = np.array([float(np.sqrt(np.mean(wav[i*fl:(i+1)*fl] ** 2)))
+                     for i in range(nf)])
+    # Z-score of frame-to-frame jumps — large spikes indicate glitches
+    d = np.abs(np.diff(rms))
+    if d.std() < 1e-10:
+        return 0.0
+    z = (d - d.mean()) / (d.std() + 1e-10)
+    # Count frames with z > 3 (severe spike)
+    n_bad = int(np.sum(z > 3.0))
+    return float(np.clip(n_bad / max(nf, 1) * 20.0, 0.0, 1.0))
+
+
 def _score(wav: np.ndarray, ref_env: np.ndarray | None, sr: int) -> float:
-    """Combined quality score: 60% voice match + 40% smoothness."""
+    """Combined quality score (higher = better).
+
+    40 % voice similarity  +  30 % smoothness  +  30 % (1 − glitch penalty)
+    """
     sm = _smoothness(wav, sr)
+    gp = _glitch_penalty(wav, sr)
     if ref_env is None:
-        return sm
+        return 0.5 * sm + 0.5 * (1.0 - gp)
     env = _mel_envelope(wav, sr)
     sim = _cosine_sim(ref_env, env)
-    return 0.6 * sim + 0.4 * sm
+    return 0.4 * sim + 0.3 * sm + 0.3 * (1.0 - gp)
 
 
-# ── Minimal cleanup: trim leading silence, fade edges ─────────────────────
+# ── Minimal cleanup: trim silence + fade edges ───────────────────────────
 
 def _find_speech_start(wav: np.ndarray, sr: int,
                        frame_ms: int = 15, thresh: float = 0.004,
                        need: int = 3, back_ms: int = 20) -> int:
+    """Scan forward to find where speech energy begins."""
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
     for s in range(0, len(wav) - fl, fl):
@@ -164,10 +191,9 @@ def _find_speech_start(wav: np.ndarray, sr: int,
 def _find_speech_end(wav: np.ndarray, sr: int,
                      frame_ms: int = 15, thresh: float = 0.004,
                      need: int = 3, tail_ms: int = 40) -> int:
-    """Find where speech ends (scan from the back)."""
+    """Scan backward to find where speech energy ends."""
     fl = max(1, int(sr * frame_ms / 1000))
     consec = 0
-    last = len(wav)
     for s in range(len(wav) - fl, 0, -fl):
         rms = float(np.sqrt(np.mean(wav[s:s+fl] ** 2)))
         if rms >= thresh:
@@ -180,20 +206,22 @@ def _find_speech_end(wav: np.ndarray, sr: int,
     return len(wav)
 
 
-def _trim_silence(wav: np.ndarray, sr: int) -> np.ndarray:
-    """Trim leading and trailing silence only — no waveform modification."""
+def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
+    """Trim leading/trailing silence  →  apply gentle fade-in / fade-out.
+
+    This is the ONLY modification applied to the raw TTS output.
+    """
     start = _find_speech_start(wav, sr)
     end = _find_speech_end(wav, sr)
     if start >= end:
-        return wav
-    return wav[start:end]
+        trimmed = wav
+    else:
+        trimmed = wav[start:end]
 
-
-def _fade(wav: np.ndarray, sr: int, in_ms: float = 30, out_ms: float = 30) -> np.ndarray:
-    """Apply gentle fade-in and fade-out to avoid hard edges."""
-    out = wav.copy()
-    n_in = min(int(sr * in_ms / 1000), len(out))
-    n_out = min(int(sr * out_ms / 1000), len(out))
+    out = trimmed.copy()
+    # 30 ms fade-in / fade-out to avoid hard clicks at the edges
+    n_in = min(int(sr * 0.030), len(out))
+    n_out = min(int(sr * 0.030), len(out))
     if n_in > 0:
         out[:n_in] *= np.linspace(0, 1, n_in, dtype=np.float32)
     if n_out > 0:
@@ -201,55 +229,12 @@ def _fade(wav: np.ndarray, sr: int, in_ms: float = 30, out_ms: float = 30) -> np
     return out
 
 
-# ── Sentence splitting ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# TTS generation — full-text best-of-N
+# ═══════════════════════════════════════════════════════════════════════════
 
-_SENT_RE = re.compile(r'(?<=[.!?])\s+')
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Keep very short fragments merged."""
-    raw = _SENT_RE.split(text.strip())
-    sentences: list[str] = []
-    for s in raw:
-        s = s.strip()
-        if not s:
-            continue
-        # Merge very short fragments (< 20 chars) with the previous sentence
-        if sentences and len(s) < 20:
-            sentences[-1] = sentences[-1] + " " + s
-        else:
-            sentences.append(s)
-    return sentences if sentences else [text.strip()]
-
-
-# ── Crossfade join ────────────────────────────────────────────────────────
-
-def _crossfade_join(chunks: list[np.ndarray], sr: int, ms: int = CROSSFADE_MS) -> np.ndarray:
-    """Join audio chunks with smooth crossfades between them."""
-    if not chunks:
-        return np.array([], dtype=np.float32)
-    if len(chunks) == 1:
-        return chunks[0]
-
-    xf = min(int(sr * ms / 1000), min(len(c) for c in chunks) // 2)
-    if xf < 2:
-        return np.concatenate(chunks)
-
-    result = chunks[0].copy()
-    for nxt in chunks[1:]:
-        # fade out the tail of result
-        fade_out = np.linspace(1, 0, xf, dtype=np.float32)
-        fade_in = np.linspace(0, 1, xf, dtype=np.float32)
-        tail = result[-xf:] * fade_out + nxt[:xf] * fade_in
-        result = np.concatenate([result[:-xf], tail, nxt[xf:]])
-
-    return result
-
-
-# ── TTS generation ────────────────────────────────────────────────────────
-
-def _tts_raw(model: TTS, text: str, samples: list[str]) -> np.ndarray:
-    """Single TTS call → float32 waveform."""
+def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
+    """Single TTS call → float32 waveform (no post-processing yet)."""
     wav = model.tts(
         text=text,
         speaker_wav=samples,
@@ -263,29 +248,31 @@ def _tts_raw(model: TTS, text: str, samples: list[str]) -> np.ndarray:
     return np.array(wav, dtype=np.float32)
 
 
-def _best_take(model: TTS, text: str, samples: list[str],
-               ref_env: np.ndarray | None, n_takes: int) -> np.ndarray:
-    """Generate *n_takes* for the same text, return the best one.
-
-    Each take is trimmed of silence and scored.  No other modification.
-    """
-    takes: list[tuple[float, np.ndarray]] = []
-    for t in range(n_takes):
+def _best_of_n(model: TTS, text: str, samples: list[str],
+               ref_env: np.ndarray | None, n: int) -> np.ndarray:
+    """Generate *n* full candidates, trim+fade each, return the highest-scored."""
+    candidates: list[tuple[float, np.ndarray]] = []
+    for i in range(n):
         try:
-            raw = _tts_raw(model, text, samples)
-            trimmed = _trim_silence(raw, OUTPUT_SR)
-            sc = _score(trimmed, ref_env, OUTPUT_SR)
-            takes.append((sc, trimmed))
-            logger.info("    Take %d/%d  %.2fs  score=%.4f",
-                        t + 1, n_takes, len(trimmed) / OUTPUT_SR, sc)
+            raw = _generate_one(model, text, samples)
+            cleaned = _trim_and_fade(raw, OUTPUT_SR)
+            sc = _score(cleaned, ref_env, OUTPUT_SR)
+            dur = len(cleaned) / OUTPUT_SR
+            candidates.append((sc, cleaned))
+            logger.info("  Candidate %d/%d — %.2fs, score %.4f", i+1, n, dur, sc)
         except Exception as e:
-            logger.warning("    Take %d/%d failed: %s", t + 1, n_takes, e)
+            logger.warning("  Candidate %d/%d failed: %s", i+1, n, e)
 
-    if not takes:
-        raise RuntimeError(f"All {n_takes} takes failed for: {text[:60]}")
+    if not candidates:
+        raise RuntimeError(f"All {n} candidates failed.")
 
-    takes.sort(key=lambda x: x[0], reverse=True)
-    return takes[0][1]
+    # Pick the best
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score = candidates[0][0]
+    best_wav = candidates[0][1]
+    logger.info("  Winner: score %.4f, %.2fs",
+                best_score, len(best_wav) / OUTPUT_SR)
+    return best_wav
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -330,13 +317,13 @@ async def lifespan(app: FastAPI):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FastAPI
+# FastAPI app
 # ═══════════════════════════════════════════════════════════════════════════
 
 app = FastAPI(
     title="My Voice API",
     description="Generate speech in your cloned voice.",
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -367,45 +354,34 @@ def health():
         "status": "ok" if ok else "degraded",
         "model_loaded": tts_model is not None,
         "voice_samples": len(voice_samples),
-        "takes_per_sentence": TAKES_PER_SENTENCE,
+        "candidates": NUM_CANDIDATES,
     }
 
 
 @app.post("/generate")
 def generate_audio(request: TextRequest):
-    """Generate clean speech: sentence-by-sentence best-of-N, crossfade joined."""
+    """Generate speech from the full text.
 
+    Produces NUM_CANDIDATES independent takes of the complete text,
+    picks the one with the best quality score, and returns it as WAV.
+
+    Post-processing is limited to silence trimming + edge fades — the
+    waveform is NEVER otherwise modified.
+    """
     if tts_model is None:
         raise HTTPException(503, "Model still loading.")
     if not voice_samples:
-        raise HTTPException(500, "No voice samples.")
+        raise HTTPException(500, "No voice samples configured.")
 
-    # 1. Split into sentences
-    sentences = _split_sentences(request.text)
-    logger.info("Text split into %d sentence(s): %s",
-                len(sentences), [s[:40] + "…" if len(s) > 40 else s for s in sentences])
+    text = request.text.strip()
+    logger.info("Generate request: %d chars, %d candidates",
+                len(text), NUM_CANDIDATES)
 
-    # 2. Generate best take per sentence
-    sentence_wavs: list[np.ndarray] = []
-    for idx, sent in enumerate(sentences):
-        logger.info("  Sentence %d/%d: \"%s\"", idx + 1, len(sentences),
-                    sent[:50] + "…" if len(sent) > 50 else sent)
-        try:
-            best = _best_take(tts_model, sent, voice_samples,
-                              ref_envelope, TAKES_PER_SENTENCE)
-            # Only apply fade to edges — do NOT modify the waveform otherwise
-            best = _fade(best, OUTPUT_SR, in_ms=20, out_ms=20)
-            sentence_wavs.append(best)
-        except RuntimeError as e:
-            logger.error("  Sentence %d failed entirely: %s", idx + 1, e)
-            raise HTTPException(500, f"Generation failed for sentence {idx + 1}.")
+    best = _best_of_n(tts_model, text, voice_samples,
+                      ref_envelope, NUM_CANDIDATES)
 
-    # 3. Crossfade-join all sentences
-    final = _crossfade_join(sentence_wavs, OUTPUT_SR, CROSSFADE_MS)
-    logger.info("Final audio: %.2fs", len(final) / OUTPUT_SR)
-
-    # 4. Save and return
     out_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.wav")
-    _save_wav(final, out_path, OUTPUT_SR)
+    _save_wav(best, out_path, OUTPUT_SR)
+    logger.info("Saved %s (%.2fs)", out_path, len(best) / OUTPUT_SR)
 
     return FileResponse(out_path, media_type="audio/wav", filename="output.wav")
