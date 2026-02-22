@@ -60,6 +60,13 @@ PRIMER_CUT_MS = int(os.getenv("TTS_PRIMER_CUT_MS", "1400"))
 # XTTS v2 native sample rate
 OUTPUT_SR = 24000
 
+# ── Audio polish parameters ────────────────────────────────────────────────
+TARGET_LUFS = float(os.getenv("TTS_TARGET_LUFS", "-18.0"))  # loudness target
+HIGH_SHELF_FREQ = float(os.getenv("TTS_HSHELF_HZ", "6000"))  # de-ess shelf
+HIGH_SHELF_GAIN_DB = float(os.getenv("TTS_HSHELF_DB", "-2.5"))  # gentle cut
+FADE_IN_MS = int(os.getenv("TTS_FADE_IN_MS", "40"))   # cosine fade-in
+FADE_OUT_MS = int(os.getenv("TTS_FADE_OUT_MS", "60"))  # cosine fade-out
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -129,12 +136,86 @@ def _reference_envelope(paths: list[str], sr: int) -> np.ndarray:
                    axis=0)
 
 
+# ── Audio polish helpers ─────────────────────────────────────────────────
+
+def _high_shelf(signal: np.ndarray, sr: int,
+                freq: float, gain_db: float) -> np.ndarray:
+    """Apply a single-pole high-shelf filter.
+
+    Frequencies above *freq* are boosted/cut by *gain_db*.
+    Uses a simple first-order IIR — cheap, zero-latency, no ringing.
+    """
+    if abs(gain_db) < 0.1:
+        return signal  # nothing to do
+    g = 10.0 ** (gain_db / 20.0)
+    w0 = 2.0 * np.pi * freq / sr
+    cos_w0 = np.cos(w0)
+    alpha = np.sin(w0) / 2.0 * np.sqrt(max((g + 1.0 / g) * (1.0 / 1.0 - 1.0) + 2.0, 0.001))
+    sq = 2.0 * np.sqrt(g) * alpha
+
+    b0 = g * ((g + 1) + (g - 1) * cos_w0 + sq)
+    b1 = -2 * g * ((g - 1) + (g + 1) * cos_w0)
+    b2 = g * ((g + 1) + (g - 1) * cos_w0 - sq)
+    a0 = (g + 1) - (g - 1) * cos_w0 + sq
+    a1 = 2 * ((g - 1) - (g + 1) * cos_w0)
+    a2 = (g + 1) - (g - 1) * cos_w0 - sq
+
+    # Normalize
+    b = np.array([b0 / a0, b1 / a0, b2 / a0])
+    a = np.array([1.0, a1 / a0, a2 / a0])
+
+    # Direct-form II transposed (forward pass only — no look-ahead)
+    out = np.zeros_like(signal)
+    z1, z2 = 0.0, 0.0
+    for i in range(len(signal)):
+        x = float(signal[i])
+        y = b[0] * x + z1
+        z1 = b[1] * x - a[1] * y + z2
+        z2 = b[2] * x - a[2] * y
+        out[i] = y
+    return out
+
+
+def _normalize_loudness(signal: np.ndarray,
+                        target_lufs: float = -18.0) -> np.ndarray:
+    """RMS-based loudness normalization (mono, simplified LUFS).
+
+    Measures the RMS of the signal, converts to approximate LUFS,
+    and scales so the output sits at *target_lufs*.
+    """
+    rms = float(np.sqrt(np.mean(signal ** 2)))
+    if rms < 1e-10:
+        return signal
+    current_lufs = 20.0 * np.log10(rms) - 0.691  # approximate LUFS for mono
+    diff = target_lufs - current_lufs
+    gain = 10.0 ** (diff / 20.0)
+    return signal * gain
+
+
 def _save_wav(wav: np.ndarray, path: str, sr: int = OUTPUT_SR) -> None:
-    """Normalize to −0.95 … +0.95 and write 16-bit WAV."""
+    """Apply final polish chain and write 16-bit WAV.
+
+    1. Remove DC offset
+    2. Gentle high-shelf cut (tames sibilance / XTTS hiss)
+    3. RMS-based loudness normalization to TARGET_LUFS
+    4. Peak-limit to −0.5 dBFS (prevents clipping)
+    """
     w = np.array(wav, dtype=np.float32)
+
+    # 1 — DC offset removal
+    w = w - np.mean(w)
+
+    # 2 — gentle high-shelf EQ (single-pole IIR)
+    w = _high_shelf(w, sr, HIGH_SHELF_FREQ, HIGH_SHELF_GAIN_DB)
+
+    # 3 — RMS loudness normalization
+    w = _normalize_loudness(w, TARGET_LUFS)
+
+    # 4 — peak-limit to −0.5 dBFS (≈ 0.944)
     peak = np.max(np.abs(w))
-    if peak > 0:
-        w = w / peak * 0.95
+    if peak > 0.944:
+        w = w * (0.944 / peak)
+
     w16 = (w * 32767).astype(np.int16)
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
@@ -176,18 +257,41 @@ def _glitch_penalty(wav: np.ndarray, sr: int, frame_ms: float = 10.0) -> float:
     return float(np.clip(n_bad / max(nf, 1) * 20.0, 0.0, 1.0))
 
 
+def _pacing_score(wav: np.ndarray, sr: int, frame_ms: float = 25.0) -> float:
+    """Score 0-1: how natural the speech pacing is.
+
+    Measures the ratio of voiced frames to total frames.  Natural speech
+    at normal speed has ~55-75 % voiced content.  Too high means the
+    model is rushing; too low means excessive pauses / silence.
+    """
+    fl = max(1, int(sr * frame_ms / 1000))
+    nf = len(wav) // fl
+    if nf < 4:
+        return 0.5
+    rms = np.array([float(np.sqrt(np.mean(wav[i*fl:(i+1)*fl] ** 2)))
+                     for i in range(nf)])
+    voiced = float(np.sum(rms > 0.008)) / nf
+    # Ideal range 0.55 – 0.75; score drops outside
+    if 0.55 <= voiced <= 0.75:
+        return 1.0
+    if voiced < 0.55:
+        return float(np.clip(voiced / 0.55, 0.0, 1.0))
+    return float(np.clip((1.0 - voiced) / 0.25, 0.0, 1.0))
+
+
 def _score(wav: np.ndarray, ref_env: np.ndarray | None, sr: int) -> float:
     """Combined quality score (higher = better).
 
-    40 % voice similarity  +  30 % smoothness  +  30 % (1 − glitch penalty)
+    35 % voice similarity  +  25 % smoothness  +  25 % (1 − glitch)  +  15 % pacing
     """
     sm = _smoothness(wav, sr)
     gp = _glitch_penalty(wav, sr)
+    pc = _pacing_score(wav, sr)
     if ref_env is None:
-        return 0.5 * sm + 0.5 * (1.0 - gp)
+        return 0.40 * sm + 0.40 * (1.0 - gp) + 0.20 * pc
     env = _mel_envelope(wav, sr)
     sim = _cosine_sim(ref_env, env)
-    return 0.4 * sim + 0.3 * sm + 0.3 * (1.0 - gp)
+    return 0.35 * sim + 0.25 * sm + 0.25 * (1.0 - gp) + 0.15 * pc
 
 
 # ── Minimal cleanup: trim silence + fade edges ───────────────────────────
@@ -324,14 +428,15 @@ def _trim_and_fade(wav: np.ndarray, sr: int,
                         gap_cut / sr, len(trimmed) / sr)
             trimmed = trimmed[:gap_cut]
 
-    # Step 2 — fade edges
+    # Step 2 — cosine fade edges (smoother than linear)
     out = trimmed.copy()
-    n_in = min(int(sr * 0.060), len(out))   # 60 ms fade-in
-    n_out = min(int(sr * 0.050), len(out))  # 50 ms fade-out
+    n_in = min(int(sr * FADE_IN_MS / 1000), len(out))
+    n_out = min(int(sr * FADE_OUT_MS / 1000), len(out))
     if n_in > 0:
-        out[:n_in] *= np.linspace(0, 1, n_in, dtype=np.float32)
+        # cosine curve: 0 → 1 with smooth acceleration
+        out[:n_in] *= (1.0 - np.cos(np.linspace(0, np.pi, n_in))) / 2.0
     if n_out > 0:
-        out[-n_out:] *= np.linspace(1, 0, n_out, dtype=np.float32)
+        out[-n_out:] *= (1.0 + np.cos(np.linspace(0, np.pi, n_out))) / 2.0
     return out
 
 
