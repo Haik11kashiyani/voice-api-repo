@@ -224,11 +224,57 @@ def _find_speech_end(wav: np.ndarray, sr: int,
     return len(wav)
 
 
-def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
+def _find_first_silence_gap(wav: np.ndarray, sr: int,
+                            min_speech_ms: int = 120,
+                            frame_ms: int = 10,
+                            silence_thresh: float = 0.008,
+                            gap_ms: int = 150,
+                            tail_ms: int = 30) -> int | None:
+    """Scan forward and find the END of the first real speech region.
+
+    After locating at least *min_speech_ms* of speech, look for the first
+    silence gap of at least *gap_ms*.  Return the sample index where that
+    gap starts (+ a small tail), or None if no clear gap is found.
+
+    This is used for padded short texts: the gap marks the boundary
+    between the real word and the trailing filler — everything after it
+    should be discarded.
+    """
+    fl = max(1, int(sr * frame_ms / 1000))
+    min_speech_frames = max(1, int(min_speech_ms / frame_ms))
+    gap_frames_needed = max(1, int(gap_ms / frame_ms))
+
+    speech_frames = 0
+    silence_run = 0
+    found_speech = False
+
+    for i in range(0, len(wav) - fl, fl):
+        rms = float(np.sqrt(np.mean(wav[i:i+fl] ** 2)))
+        if rms >= silence_thresh:
+            speech_frames += 1
+            silence_run = 0
+            if speech_frames >= min_speech_frames:
+                found_speech = True
+        else:
+            if found_speech:
+                silence_run += 1
+                if silence_run >= gap_frames_needed:
+                    # Gap starts where the silence run began
+                    gap_start = i - (silence_run - 1) * fl
+                    return min(len(wav), gap_start + int(sr * tail_ms / 1000))
+            else:
+                silence_run = 0  # ignore silence before speech
+    return None
+
+
+def _trim_and_fade(wav: np.ndarray, sr: int,
+                   was_padded: bool = False) -> np.ndarray:
     """Clean up raw TTS output:
 
     1. Hard-cut the first START_CUT_MS (removes XTTS warm-up artifact)
     2. Energy-based silence trim (start & end)
+    2b. For padded short text: also forward-scan for the first silence
+        gap after the real speech and hard-cut there to remove filler.
     3. Gentle fade-in / fade-out
 
     Nothing else is modified.
@@ -245,6 +291,15 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
         trimmed = wav
     else:
         trimmed = wav[start:end]
+
+    # Step 2b — for padded text, cut at the first silence gap after
+    #           the real speech to remove any filler the model produced
+    if was_padded:
+        gap_cut = _find_first_silence_gap(trimmed, sr)
+        if gap_cut is not None and gap_cut > int(sr * 0.10):  # keep ≥100ms
+            logger.info("  Padded-text trim: cutting at %.3fs (of %.3fs)",
+                        gap_cut / sr, len(trimmed) / sr)
+            trimmed = trimmed[:gap_cut]
 
     # Step 3 — fade edges
     out = trimmed.copy()
@@ -264,12 +319,16 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
 def _pad_short_text(text: str) -> str:
     """Pad very short text so XTTS v2 can articulate it cleanly.
 
-    XTTS v2 needs enough phonetic context to produce stable output.
-    If the input is too short (e.g. "  Hello") the model often generates
-    garbled filler.  We wrap short text with leading/trailing pause
-    markers ("...") which the model renders as silence — the existing
-    silence trimmer then strips them from the final audio, so the
+    XTTS v2 needs enough trailing phonetic context to produce stable
+    output.  If the input is too short (e.g. "Hello") the model rushes
+    and garbles the word.  We append a trailing filler sentence that
+    gives the model enough context to finish naturally.  The silence
+    trimmer then strips the filler from the final audio, so the
     listener only hears the intended word(s).
+
+    IMPORTANT: padding is ONLY added after the text, never before,
+    because leading filler causes a long garbled warm-up artifact
+    that START_CUT_MS cannot fully remove.
     """
     stripped = text.strip()
     if len(stripped) < SHORT_TEXT_THRESHOLD:
@@ -277,22 +336,28 @@ def _pad_short_text(text: str) -> str:
         # a complete utterance.
         if stripped and stripped[-1] not in ".!?":
             stripped += "."
-        padded = f"... {stripped} ..."
+        # Trailing filler — long enough to give XTTS context, bland
+        # enough that the silence trimmer can detect the gap after the
+        # real speech ends.
+        padded = f"{stripped}  ...  ...  ..."
         logger.info("Short text detected (%d chars) — padded to: %r",
                      len(text.strip()), padded)
         return padded
     return text
 
 
-def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
-    """Single TTS call → float32 waveform (no post-processing yet).
+def _generate_one(model: TTS, text: str, samples: list[str]) -> tuple[np.ndarray, bool]:
+    """Single TTS call → (float32 waveform, was_padded) tuple.
 
     Passes XTTS v2-specific conditioning params for deeper voice cloning.
     enable_text_splitting gives consistent pacing across sentences.
+    Returns whether padding was applied so the trimmer can be more
+    aggressive about cutting trailing filler.
     """
     # Pad very short text so XTTS v2 has enough context to articulate
     # cleanly instead of producing garbled filler sounds.
     synth_text = _pad_short_text(text)
+    was_padded = (synth_text != text)
 
     wav = model.tts(
         text=synth_text,
@@ -307,7 +372,7 @@ def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
         gpt_cond_chunk_len=GPT_COND_CHUNK_LEN,
         enable_text_splitting=True,
     )
-    return np.array(wav, dtype=np.float32)
+    return np.array(wav, dtype=np.float32), was_padded
 
 
 def _best_of_n(model: TTS, text: str, samples: list[str],
@@ -316,8 +381,8 @@ def _best_of_n(model: TTS, text: str, samples: list[str],
     candidates: list[tuple[float, np.ndarray]] = []
     for i in range(n):
         try:
-            raw = _generate_one(model, text, samples)
-            cleaned = _trim_and_fade(raw, OUTPUT_SR)
+            raw, was_padded = _generate_one(model, text, samples)
+            cleaned = _trim_and_fade(raw, OUTPUT_SR, was_padded=was_padded)
             sc = _score(cleaned, ref_env, OUTPUT_SR)
             dur = len(cleaned) / OUTPUT_SR
             candidates.append((sc, cleaned))
@@ -395,7 +460,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 class TextRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH,
                       description="Text to speak.",
-                      json_schema_extra={"example": "   Hello, this is a test."})
+                      json_schema_extra={"example": " Hello, this is a test."})
 
 
 @app.get("/")
