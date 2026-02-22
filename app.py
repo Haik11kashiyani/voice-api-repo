@@ -1,12 +1,13 @@
 import os
 import glob
+import time
 import uuid
 import wave
 import logging
 from contextlib import asynccontextmanager
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -471,14 +472,27 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down.")
 
 
+# ── Temp file cleanup ────────────────────────────────────────────────────
+
+def _cleanup_tmp(path: str, delay: float = 5.0) -> None:
+    """Delete a temp WAV file after a short delay (gives time for streaming)."""
+    try:
+        time.sleep(delay)
+        if os.path.exists(path):
+            os.remove(path)
+            logger.debug("Cleaned up %s", path)
+    except OSError:
+        pass  # non-critical — /tmp is ephemeral anyway
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FastAPI app
 # ═══════════════════════════════════════════════════════════════════════════
 
 app = FastAPI(
     title="My Voice API",
-    description="Generate speech in your cloned voice.",
-    version="4.0.0",
+    description="Generate speech in your cloned voice using XTTS v2.",
+    version="5.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -488,7 +502,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 class TextRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH,
                       description="Text to speak.",
-                      json_schema_extra={"example": " Hello, this is a test."})
+                      json_schema_extra={"example": "Hello, this is a test."})
 
 
 @app.get("/")
@@ -510,33 +524,43 @@ def health():
         "model_loaded": tts_model is not None,
         "voice_samples": len(voice_samples),
         "candidates": NUM_CANDIDATES,
+        "primer": PRIMER_WORD,
+        "primer_cut_ms": PRIMER_CUT_MS,
+        "model": MODEL_NAME,
     }
 
 
 @app.post("/generate")
-def generate_audio(request: TextRequest):
+def generate_audio(request: TextRequest, bg: BackgroundTasks):
     """Generate speech from the full text.
 
     Produces NUM_CANDIDATES independent takes of the complete text,
     picks the one with the best quality score, and returns it as WAV.
 
-    Post-processing is limited to silence trimming + edge fades — the
-    waveform is NEVER otherwise modified.
+    Post-processing: primer removal → silence trim → edge fades.
+    The waveform is never otherwise modified.
     """
     if tts_model is None:
-        raise HTTPException(503, "Model still loading.")
+        raise HTTPException(503, detail="Model still loading.")
     if not voice_samples:
-        raise HTTPException(500, "No voice samples configured.")
+        raise HTTPException(500, detail="No voice samples configured.")
 
     text = request.text.strip()
     logger.info("Generate request: %d chars, %d candidates",
                 len(text), NUM_CANDIDATES)
 
+    t0 = time.monotonic()
     best = _best_of_n(tts_model, text, voice_samples,
                       ref_envelope, NUM_CANDIDATES)
+    elapsed = time.monotonic() - t0
 
     out_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.wav")
     _save_wav(best, out_path, OUTPUT_SR)
-    logger.info("Saved %s (%.2fs)", out_path, len(best) / OUTPUT_SR)
+    duration = len(best) / OUTPUT_SR
+    logger.info("Saved %s (%.2fs audio, generated in %.1fs)",
+                out_path, duration, elapsed)
+
+    # Clean up the temp file after the response has been sent
+    bg.add_task(_cleanup_tmp, out_path)
 
     return FileResponse(out_path, media_type="audio/wav", filename="output.wav")
