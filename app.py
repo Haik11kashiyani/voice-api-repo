@@ -41,6 +41,11 @@ NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "5"))
 # few phonemes). Hard-cut this many milliseconds BEFORE energy-based trimming.
 START_CUT_MS = int(os.getenv("TTS_START_CUT_MS", "180"))
 
+# Short texts (fewer chars than this) get padded with silence markers so
+# XTTS v2 has enough context to produce a clean waveform instead of
+# garbled filler like "one sec".
+SHORT_TEXT_THRESHOLD = int(os.getenv("TTS_SHORT_TEXT_THRESH", "15"))
+
 # XTTS v2 native sample rate
 OUTPUT_SR = 24000
 
@@ -256,14 +261,41 @@ def _trim_and_fade(wav: np.ndarray, sr: int) -> np.ndarray:
 # TTS generation — full-text best-of-N
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _pad_short_text(text: str) -> str:
+    """Pad very short text so XTTS v2 can articulate it cleanly.
+
+    XTTS v2 needs enough phonetic context to produce stable output.
+    If the input is too short (e.g. "  Hello") the model often generates
+    garbled filler.  We wrap short text with leading/trailing pause
+    markers ("...") which the model renders as silence — the existing
+    silence trimmer then strips them from the final audio, so the
+    listener only hears the intended word(s).
+    """
+    stripped = text.strip()
+    if len(stripped) < SHORT_TEXT_THRESHOLD:
+        # Ensure proper sentence punctuation so the model treats it as
+        # a complete utterance.
+        if stripped and stripped[-1] not in ".!?":
+            stripped += "."
+        padded = f"... {stripped} ..."
+        logger.info("Short text detected (%d chars) — padded to: %r",
+                     len(text.strip()), padded)
+        return padded
+    return text
+
+
 def _generate_one(model: TTS, text: str, samples: list[str]) -> np.ndarray:
     """Single TTS call → float32 waveform (no post-processing yet).
 
     Passes XTTS v2-specific conditioning params for deeper voice cloning.
     enable_text_splitting gives consistent pacing across sentences.
     """
+    # Pad very short text so XTTS v2 has enough context to articulate
+    # cleanly instead of producing garbled filler sounds.
+    synth_text = _pad_short_text(text)
+
     wav = model.tts(
-        text=text,
+        text=synth_text,
         speaker_wav=samples,
         language="en",
         temperature=TEMPERATURE,
@@ -363,7 +395,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 class TextRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TEXT_LENGTH,
                       description="Text to speak.",
-                      json_schema_extra={"example": "Hello, this is a test."})
+                      json_schema_extra={"example": "   Hello, this is a test."})
 
 
 @app.get("/")
