@@ -41,10 +41,20 @@ NUM_CANDIDATES = int(os.getenv("TTS_CANDIDATES", "5"))
 # few phonemes). Hard-cut this many milliseconds BEFORE energy-based trimming.
 START_CUT_MS = int(os.getenv("TTS_START_CUT_MS", "180"))
 
-# Short texts (fewer chars than this) get padded with silence markers so
-# XTTS v2 has enough context to produce a clean waveform instead of
-# garbled filler like "one sec".
+# Short texts (fewer chars than this) get trailing padding so XTTS v2 has
+# enough context to produce a clean waveform.
 SHORT_TEXT_THRESHOLD = int(os.getenv("TTS_SHORT_TEXT_THRESH", "15"))
+
+# ── Primer sentence ──────────────────────────────────────────────────────
+# XTTS v2 garbles the first ~1s of every generation (warm-up artifact).
+# Instead of trimming distorted audio, we prepend a throwaway "primer"
+# sentence that absorbs the artifact.  After generation we locate the
+# silence gap between the primer and the real text, discard everything
+# before it, and the listener only hears the clean real speech.
+PRIMER_SENTENCE = os.getenv(
+    "TTS_PRIMER",
+    "It was a bright cold day in April and the clocks were striking thirteen."
+)
 
 # XTTS v2 native sample rate
 OUTPUT_SR = 24000
@@ -267,22 +277,78 @@ def _find_first_silence_gap(wav: np.ndarray, sr: int,
     return None
 
 
+def _find_speech_after_primer(wav: np.ndarray, sr: int,
+                              min_primer_ms: int = 800,
+                              frame_ms: int = 10,
+                              silence_thresh: float = 0.008,
+                              gap_ms: int = 120,
+                              lead_ms: int = 10) -> int | None:
+    """Find where the real text starts AFTER the primer sentence.
+
+    Strategy:
+    1. Skip at least *min_primer_ms* (the primer is ~3-4 s but we set a
+       safe minimum so we don't accidentally cut into a long primer).
+    2. From that point, scan forward looking for a silence gap ≥ *gap_ms*.
+    3. After finding the gap, continue scanning until speech energy
+       resumes — that's the start of the real text.
+    4. Return the sample index (minus a small *lead_ms* cushion).
+
+    Returns None if no suitable boundary is found.
+    """
+    fl = max(1, int(sr * frame_ms / 1000))
+    gap_frames_needed = max(1, int(gap_ms / frame_ms))
+    start_sample = int(sr * min_primer_ms / 1000)
+
+    silence_run = 0
+    in_gap = False
+
+    for i in range(start_sample, len(wav) - fl, fl):
+        rms = float(np.sqrt(np.mean(wav[i:i+fl] ** 2)))
+        if rms < silence_thresh:
+            silence_run += 1
+            if silence_run >= gap_frames_needed:
+                in_gap = True
+        else:
+            if in_gap:
+                # Speech resumed after the gap — this is the real text
+                cut = max(0, i - int(sr * lead_ms / 1000))
+                return cut
+            silence_run = 0
+    return None
+
+
 def _trim_and_fade(wav: np.ndarray, sr: int,
+                   has_primer: bool = True,
                    was_padded: bool = False) -> np.ndarray:
     """Clean up raw TTS output:
 
-    1. Hard-cut the first START_CUT_MS (removes XTTS warm-up artifact)
+    0. If a primer was prepended, find the silence gap between the primer
+       and the real text, discard everything before it.  This completely
+       eliminates the XTTS warm-up artifact (the primer absorbed it).
+    1. Fallback hard-cut of START_CUT_MS (only if primer detection fails)
     2. Energy-based silence trim (start & end)
     2b. For padded short text: also forward-scan for the first silence
         gap after the real speech and hard-cut there to remove filler.
     3. Gentle fade-in / fade-out
-
-    Nothing else is modified.
     """
-    # Step 1 — hard-cut the warm-up artifact at the very start
-    hard_cut = int(sr * START_CUT_MS / 1000)
-    if hard_cut < len(wav):
-        wav = wav[hard_cut:]
+    # Step 0 — discard primer + warm-up artifact
+    if has_primer:
+        cut_at = _find_speech_after_primer(wav, sr)
+        if cut_at is not None:
+            logger.info("  Primer cut: discarding first %.3fs, keeping from %.3fs",
+                        cut_at / sr, cut_at / sr)
+            wav = wav[cut_at:]
+        else:
+            # Primer gap not found — fall back to hard-cut
+            logger.warning("  Primer gap not detected, falling back to hard-cut")
+            hard_cut = int(sr * START_CUT_MS / 1000)
+            if hard_cut < len(wav):
+                wav = wav[hard_cut:]
+    else:
+        # No primer — legacy hard-cut
+        hard_cut = int(sr * START_CUT_MS / 1000)
+        if hard_cut < len(wav):
+            wav = wav[hard_cut:]
 
     # Step 2 — energy-based silence trim
     start = _find_speech_start(wav, sr)
@@ -349,18 +415,23 @@ def _pad_short_text(text: str) -> str:
 def _generate_one(model: TTS, text: str, samples: list[str]) -> tuple[np.ndarray, bool]:
     """Single TTS call → (float32 waveform, was_padded) tuple.
 
-    Passes XTTS v2-specific conditioning params for deeper voice cloning.
-    enable_text_splitting gives consistent pacing across sentences.
-    Returns whether padding was applied so the trimmer can be more
-    aggressive about cutting trailing filler.
+    Prepends a primer sentence so the XTTS warm-up artifact lands on
+    the throwaway primer instead of the real text.  Also pads short
+    texts with trailing filler.
     """
     # Pad very short text so XTTS v2 has enough context to articulate
     # cleanly instead of producing garbled filler sounds.
     synth_text = _pad_short_text(text)
     was_padded = (synth_text != text)
 
+    # Prepend the primer sentence — it absorbs the warm-up artifact.
+    # The silence gap between primer and real text is detected later
+    # by _find_speech_after_primer() and everything before is discarded.
+    full_text = f"{PRIMER_SENTENCE} ... {synth_text}"
+    logger.info("  Synth text: %r", full_text)
+
     wav = model.tts(
-        text=synth_text,
+        text=full_text,
         speaker_wav=samples,
         language="en",
         temperature=TEMPERATURE,
@@ -382,7 +453,9 @@ def _best_of_n(model: TTS, text: str, samples: list[str],
     for i in range(n):
         try:
             raw, was_padded = _generate_one(model, text, samples)
-            cleaned = _trim_and_fade(raw, OUTPUT_SR, was_padded=was_padded)
+            cleaned = _trim_and_fade(raw, OUTPUT_SR,
+                                     has_primer=True,
+                                     was_padded=was_padded)
             sc = _score(cleaned, ref_env, OUTPUT_SR)
             dur = len(cleaned) / OUTPUT_SR
             candidates.append((sc, cleaned))
